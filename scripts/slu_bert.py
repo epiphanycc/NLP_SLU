@@ -31,7 +31,7 @@ print("Load dataset and database finished, cost %.4fs ..." % (time.time() - star
 print("Dataset size: train -> %d ; dev -> %d" % (len(train_dataset), len(dev_dataset)))
 
 # Load pre-trained BERT model and tokenizer
-bert_model_path = os.path.abspath(os.path.join(install_path, 'bert-base-uncased'))
+bert_model_path = os.path.abspath(os.path.join(install_path, 'bert-base-chinese'))
 tokenizer = BertTokenizer.from_pretrained(bert_model_path)
 model = BertForTokenClassification.from_pretrained(
     bert_model_path,

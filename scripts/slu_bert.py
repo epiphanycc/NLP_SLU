@@ -12,6 +12,7 @@ from utils.initialization import *
 from utils.example import Example
 from utils.batch import from_example_list
 from utils.vocab import PAD
+from torch.utils.tensorboard import SummaryWriter
 
 # initialization params, output path, logger, random seed and torch.device
 args = init_args(sys.argv[1:])
@@ -35,18 +36,18 @@ bert_model_path = os.path.abspath(os.path.join(install_path, 'bert-base-chinese'
 tokenizer = BertTokenizer.from_pretrained(bert_model_path)
 model = BertForTokenClassification.from_pretrained(
     bert_model_path,
-    num_labels=Example.label_vocab.num_tags
+    num_labels=Example.label_vocab.num_tags,
 ).to(device)
 
-if args.testing:
-    check_point = torch.load(open('model.bin', 'rb'), map_location=device)
-    model.load_state_dict(check_point['model'])
-    print("Load saved model from root path")
+# if args.testing:
+check_point = torch.load(open('model1.bin', 'rb'), map_location=device)
+model.load_state_dict(check_point['model'])
+print("Load saved model from root path")
 
 def set_optimizer(model, args):
     params = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
     grouped_params = [{'params': list(set([p for n, p in params]))}]
-    optimizer = Adam(grouped_params, lr=args.lr)
+    optimizer = Adam(grouped_params, lr=args.lr, weight_decay=0.01)
     return optimizer
 
 def encode_batch(dataset, tokenizer, max_len):
@@ -78,7 +79,66 @@ def decode(choice):
             labels.extend(label_ids.cpu().tolist())
             total_loss += loss.item()
             count += 1
-        metrics = Example.evaluator.acc(predictions, labels)
+
+        # 将预测的标签 ID 转换为 act-slot-value 三元组
+        converted_predictions = []
+        for pred in predictions:
+            triplets = []
+            current_slot = None
+            current_value = []
+            for idx in pred:
+                label = Example.label_vocab.convert_idx_to_tag(idx)
+                if label.startswith("B-"):  # Start of a new act-slot-value
+                    if current_slot is not None:
+                        # Convert the current triplet into a string format 'act-slot-value1-value2'
+                        triplet_str = f"{current_slot}-{''.join(current_value)}"
+                        triplets.append(triplet_str)  # Save the last triplet
+                    current_slot = label[2:]  # act-slot, remove B- prefix
+                    current_value = [label.split("-")[-1]]  # Value is the part after the last dash
+                elif label.startswith("I-"):  # Inside an existing act-slot-value
+                    current_value.append(label.split("-")[-1])  # Add value to current triplet
+                elif label == "O" and current_slot is not None:  # End of current act-slot-value
+                    triplet_str = f"{current_slot}-{''.join(current_value)}"
+                    triplets.append(triplet_str)
+                    current_slot = None
+                    current_value = []
+            if current_slot is not None:  # Ensure to add the last slot-value pair
+                triplet_str = f"{current_slot}-{''.join(current_value)}"
+                triplets.append(triplet_str)
+
+            converted_predictions.append(triplets)
+
+        # 将真实标签 label_ids 也转换为 act-slot-value 三元组
+        converted_labels = []
+        for label in labels:
+            triplets = []
+            current_slot = None
+            current_value = []
+            for idx in label:
+                label_name = Example.label_vocab.convert_idx_to_tag(idx)
+                if label_name.startswith("B-"):  # Start of a new act-slot-value
+                    if current_slot is not None:
+                        # Convert the current triplet into a string format 'act-slot-value1-value2'
+                        triplet_str = f"{current_slot}-{''.join(current_value)}"
+                        triplets.append(triplet_str)  # Save the last triplet
+                    current_slot = label_name[2:]  # act-slot, remove B- prefix
+                    current_value = [label_name.split("-")[-1]]  # Value is the part after the last dash
+                elif label_name.startswith("I-"):  # Inside an existing act-slot-value
+                    current_value.append(label_name.split("-")[-1])  # Add value to current triplet
+                elif label_name == "O" and current_slot is not None:  # End of current act-slot-value
+                    triplet_str = f"{current_slot}-{''.join(current_value)}"
+                    triplets.append(triplet_str)
+                    current_slot = None
+                    current_value = []
+            if current_slot is not None:  # Ensure to add the last slot-value pair
+                triplet_str = f"{current_slot}-{''.join(current_value)}"
+                triplets.append(triplet_str)
+
+            converted_labels.append(triplets)
+
+        # 计算精确度、召回率和F1分数
+        metrics = Example.evaluator.acc(converted_predictions, converted_labels)
+
     torch.cuda.empty_cache()
     gc.collect()
     return metrics, total_loss / count
@@ -107,51 +167,58 @@ def predict():
             ptr += 1
     json.dump(test_json, open(os.path.join(args.dataroot, 'prediction.json'), 'w', encoding='utf-8'), indent=4, ensure_ascii=False)
 
-if not args.testing:
-    num_training_steps = ((len(train_dataset) + args.batch_size - 1) // args.batch_size) * args.max_epoch
-    print('Total training steps: %d' % (num_training_steps))
-    optimizer = set_optimizer(model, args)
-    nsamples, best_result = len(train_dataset), {'dev_acc': 0., 'dev_f1': 0.}
-    train_index, step_size = np.arange(nsamples), args.batch_size
-    print('Start training ......')
-    for i in range(args.max_epoch):
-        start_time = time.time()
-        epoch_loss = 0
-        np.random.shuffle(train_index)
-        model.train()
-        count = 0
-        for j in range(0, nsamples, step_size):
-            cur_dataset = [train_dataset[k] for k in train_index[j: j + step_size]]
-            input_ids, attention_masks, label_ids = encode_batch(cur_dataset, tokenizer, args.max_seq_len)
-            input_ids, attention_masks, label_ids = input_ids.to(device), attention_masks.to(device), label_ids.to(device)
+# if not args.testing:
+#     writer = SummaryWriter(log_dir="runs/slu_experiment")
+#     num_training_steps = ((len(train_dataset) + args.batch_size - 1) // args.batch_size) * args.max_epoch
+#     print('Total training steps: %d' % (num_training_steps))
+#     optimizer = set_optimizer(model, args)
+#     nsamples, best_result = len(train_dataset), {'dev_acc': 0., 'dev_f1': 0.}
+#     train_index, step_size = np.arange(nsamples), args.batch_size
+#     print('Start training ......')
+#     loss_cnt = 0
+#     for i in range(args.max_epoch):
+#         start_time = time.time()
+#         epoch_loss = 0
+#         np.random.shuffle(train_index)
+#         model.train()
+#         count = 0
+#         for j in range(0, nsamples, step_size):
+#             cur_dataset = [train_dataset[k] for k in train_index[j: j + step_size]]
+#             input_ids, attention_masks, label_ids = encode_batch(cur_dataset, tokenizer, args.max_seq_len)
+#             input_ids, attention_masks, label_ids = input_ids.to(device), attention_masks.to(device), label_ids.to(device)
 
-            outputs = model(input_ids, attention_mask=attention_masks, labels=label_ids)
-            loss = outputs.loss
-            epoch_loss += loss.item()
-            loss.backward()
-            optimizer.step()
-            optimizer.zero_grad()
-            count += 1
-        print('Training: \tEpoch: %d\tTime: %.4f\tTraining Loss: %.4f' % (i, time.time() - start_time, epoch_loss / count))
-        torch.cuda.empty_cache()
-        gc.collect()
+#             outputs = model(input_ids, attention_mask=attention_masks, labels=label_ids)
+#             loss = outputs.loss
+#             epoch_loss += loss.item()
+#             loss.backward()
+#             writer.add_scalar('Loss/train', loss , loss_cnt)
+#             loss_cnt += 1
+#             optimizer.step()
+#             optimizer.zero_grad()
+#             count += 1
+#         print('Training: \tEpoch: %d\tTime: %.4f\tTraining Loss: %.4f' % (i, time.time() - start_time, epoch_loss / count))
+#         torch.cuda.empty_cache()
+#         gc.collect()
 
-        start_time = time.time()
-        metrics, dev_loss = decode('dev')
-        dev_acc, dev_fscore = metrics['acc'], metrics['fscore']
-        print('Evaluation: \tEpoch: %d\tTime: %.4f\tDev acc: %.2f\tDev fscore(p/r/f): (%.2f/%.2f/%.2f)' % (i, time.time() - start_time, dev_acc, dev_fscore['precision'], dev_fscore['recall'], dev_fscore['fscore']))
-        if dev_acc > best_result['dev_acc']:
-            best_result['dev_loss'], best_result['dev_acc'], best_result['dev_f1'], best_result['iter'] = dev_loss, dev_acc, dev_fscore, i
-            torch.save({
-                'epoch': i, 'model': model.state_dict(),
-                'optim': optimizer.state_dict(),
-            }, open('model.bin', 'wb'))
-            print('NEW BEST MODEL: \tEpoch: %d\tDev loss: %.4f\tDev acc: %.2f\tDev fscore(p/r/f): (%.2f/%.2f/%.2f)' % (i, dev_loss, dev_acc, dev_fscore['precision'], dev_fscore['recall'], dev_fscore['fscore']))
+#         start_time = time.time()
+#         metrics, dev_loss = decode('dev')
+#         dev_acc, dev_fscore = metrics['acc'], metrics['fscore']
+#         writer.add_scalar('Loss/dev', dev_loss, i)
+#         writer.add_scalar('Accuracy/dev', dev_acc, i)
+#         writer.add_scalar('F1/dev', dev_fscore['fscore'], i)
+#         print('Evaluation: \tEpoch: %d\tTime: %.4f\tDev acc: %.2f\tDev fscore(p/r/f): (%.2f/%.2f/%.2f)' % (i, time.time() - start_time, dev_acc, dev_fscore['precision'], dev_fscore['recall'], dev_fscore['fscore']))
+#         if dev_acc > best_result['dev_acc']:
+#             best_result['dev_loss'], best_result['dev_acc'], best_result['dev_f1'], best_result['iter'] = dev_loss, dev_acc, dev_fscore, i
+#             torch.save({
+#                 'epoch': i, 'model': model.state_dict(),
+#                 'optim': optimizer.state_dict(),
+#             }, open('model.bin', 'wb'))
+#             print('NEW BEST MODEL: \tEpoch: %d\tDev loss: %.4f\tDev acc: %.2f\tDev fscore(p/r/f): (%.2f/%.2f/%.2f)' % (i, dev_loss, dev_acc, dev_fscore['precision'], dev_fscore['recall'], dev_fscore['fscore']))
 
-    print('FINAL BEST RESULT: \tEpoch: %d\tDev loss: %.4f\tDev acc: %.4f\tDev fscore(p/r/f): (%.4f/%.4f/%.4f)' % (best_result['iter'], best_result['dev_loss'], best_result['dev_acc'], best_result['dev_f1']['precision'], best_result['dev_f1']['recall'], best_result['dev_f1']['fscore']))
-else:
-    start_time = time.time()
-    metrics, dev_loss = decode('dev')
-    dev_acc, dev_fscore = metrics['acc'], metrics['fscore']
-    predict()
-    print("Evaluation costs %.2fs ; Dev loss: %.4f\tDev acc: %.2f\tDev fscore(p/r/f): (%.2f/%.2f/%.2f)" % (time.time() - start_time, dev_loss, dev_acc, dev_fscore['precision'], dev_fscore['recall'], dev_fscore['fscore']))
+#     print('FINAL BEST RESULT: \tEpoch: %d\tDev loss: %.4f\tDev acc: %.4f\tDev fscore(p/r/f): (%.4f/%.4f/%.4f)' % (best_result['iter'], best_result['dev_loss'], best_result['dev_acc'], best_result['dev_f1']['precision'], best_result['dev_f1']['recall'], best_result['dev_f1']['fscore']))
+# else:
+start_time = time.time()
+metrics, dev_loss = decode('dev')
+dev_acc, dev_fscore = metrics['acc'], metrics['fscore']
+predict()
+print("Evaluation costs %.2fs ; Dev loss: %.4f\tDev acc: %.2f\tDev fscore(p/r/f): (%.2f/%.2f/%.2f)" % (time.time() - start_time, dev_loss, dev_acc, dev_fscore['precision'], dev_fscore['recall'], dev_fscore['fscore']))

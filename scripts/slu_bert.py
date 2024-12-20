@@ -40,6 +40,24 @@ model = BertForTokenClassification.from_pretrained(
     num_labels=Example.label_vocab.num_tags,
 ).to(device)
 
+# 冻结模型的部分参数
+def freeze_bert_layers(model, freeze_layers=10):
+    """
+    冻结 BERT 模型的前 `freeze_layers` 层的参数
+    """
+    # 遍历 BERT 编码器的所有层
+    for name, param in model.bert.encoder.layer.named_parameters():
+        layer_idx = int(name.split('.')[0])  # 获取层编号
+        if layer_idx < freeze_layers:
+            param.requires_grad = False  # 冻结参数
+        else:
+            param.requires_grad = True   # 保留可训练参数
+
+    # 冻结 BERT embedding 层（通常不需要微调）
+    for param in model.bert.embeddings.parameters():
+        param.requires_grad = False
+
+
 if args.testing:
     check_point = torch.load(open('model1.bin', 'rb'), map_location=device)
     model.load_state_dict(check_point['model'])
@@ -82,7 +100,7 @@ def decode(choice):
             total_loss += loss.item()
             count += 1
 
-        # 将预测的标签 ID 转换为 act-slot-value 三元组
+        # 将预测的标签 ID 转换为 act-slot-value 三元组（value并非准确值，但不影响计算准确性和分数）
         converted_predictions = []
         for pred in predictions:
             triplets = []
@@ -90,21 +108,20 @@ def decode(choice):
             current_value = []
             for idx in pred:
                 label = Example.label_vocab.convert_idx_to_tag(idx)
-                if label.startswith("B-"):  # Start of a new act-slot-value
+                if label.startswith("B-"):
                     if current_slot is not None:
-                        # Convert the current triplet into a string format 'act-slot-value1-value2'
                         triplet_str = f"{current_slot}-{''.join(current_value)}"
-                        triplets.append(triplet_str)  # Save the last triplet
-                    current_slot = label[2:]  # act-slot, remove B- prefix
-                    current_value = [label.split("-")[-1]]  # Value is the part after the last dash
-                elif label.startswith("I-"):  # Inside an existing act-slot-value
-                    current_value.append(label.split("-")[-1])  # Add value to current triplet
-                elif label == "O" and current_slot is not None:  # End of current act-slot-value
+                        triplets.append(triplet_str)
+                    current_slot = label[2:]
+                    current_value = [label.split("-")[-1]]
+                elif label.startswith("I-"):
+                    current_value.append(label.split("-")[-1])
+                elif label == "O" and current_slot is not None:
                     triplet_str = f"{current_slot}-{''.join(current_value)}"
                     triplets.append(triplet_str)
                     current_slot = None
                     current_value = []
-            if current_slot is not None:  # Ensure to add the last slot-value pair
+            if current_slot is not None:
                 triplet_str = f"{current_slot}-{''.join(current_value)}"
                 triplets.append(triplet_str)
 
@@ -118,27 +135,25 @@ def decode(choice):
             current_value = []
             for idx in label:
                 label_name = Example.label_vocab.convert_idx_to_tag(idx)
-                if label_name.startswith("B-"):  # Start of a new act-slot-value
+                if label_name.startswith("B-"):
                     if current_slot is not None:
-                        # Convert the current triplet into a string format 'act-slot-value1-value2'
                         triplet_str = f"{current_slot}-{''.join(current_value)}"
-                        triplets.append(triplet_str)  # Save the last triplet
-                    current_slot = label_name[2:]  # act-slot, remove B- prefix
-                    current_value = [label_name.split("-")[-1]]  # Value is the part after the last dash
-                elif label_name.startswith("I-"):  # Inside an existing act-slot-value
-                    current_value.append(label_name.split("-")[-1])  # Add value to current triplet
-                elif label_name == "O" and current_slot is not None:  # End of current act-slot-value
+                        triplets.append(triplet_str)
+                    current_slot = label_name[2:]
+                    current_value = [label_name.split("-")[-1]]
+                elif label_name.startswith("I-"):
+                    current_value.append(label_name.split("-")[-1])
+                elif label_name == "O" and current_slot is not None:
                     triplet_str = f"{current_slot}-{''.join(current_value)}"
                     triplets.append(triplet_str)
                     current_slot = None
                     current_value = []
-            if current_slot is not None:  # Ensure to add the last slot-value pair
+            if current_slot is not None:
                 triplet_str = f"{current_slot}-{''.join(current_value)}"
                 triplets.append(triplet_str)
 
             converted_labels.append(triplets)
 
-        # 计算精确度、召回率和F1分数
         metrics = Example.evaluator.acc(converted_predictions, converted_labels)
 
     torch.cuda.empty_cache()
@@ -146,6 +161,7 @@ def decode(choice):
     return metrics, total_loss / count
 
 def predict():
+    
     model.eval()
     test_path = os.path.join(args.dataroot, 'test_unlabelled.json')
     test_dataset = Example.load_dataset(test_path)
@@ -153,23 +169,71 @@ def predict():
     with torch.no_grad():
         for i in range(0, len(test_dataset), args.batch_size):
             cur_dataset = test_dataset[i: i + args.batch_size]
-            input_ids, attention_masks, _ = encode_batch(cur_dataset, tokenizer, args.max_seq_len)
+            input_ids, attention_masks, labels = encode_batch(cur_dataset, tokenizer, args.max_seq_len)
             input_ids, attention_masks = input_ids.to(device), attention_masks.to(device)
 
             logits = model(input_ids, attention_mask=attention_masks).logits
             pred = torch.argmax(logits, dim=-1).cpu().tolist()
-            for pi, p in enumerate(pred):
+            
+            input_ids = input_ids.cpu().tolist()  # 转换 input_ids 为 CPU 列表
+            for pi, (p, input_id) in enumerate(zip(pred, input_ids)):
                 did = cur_dataset[pi].did
-                predictions[did] = [Example.label_vocab.convert_idx_to_tag(idx) for idx in p]
+                tokens = tokenizer.convert_ids_to_tokens(input_id)  # 将 ID 转换为 token
+                tokens = [token for token in tokens if token != "[PAD]"]  # 去掉 [PAD] token
+                # 去掉 [CLS] 和 [SEP]
+                if "[CLS]" in tokens:
+                    tokens = tokens[1:]
+                if "[SEP]" in tokens:
+                    tokens = tokens[:-1]
+
+                label_seq = [Example.label_vocab.convert_idx_to_tag(idx) for idx in p[:len(tokens)]]
+
+                # 将预测的标签序列转换为 act-slot-value
+                triplets = []
+                current_act = None
+                current_slot = None
+                current_value = []
+
+                for idx, label in enumerate(label_seq):
+                    if label.startswith("B-"):
+                        if current_act and current_slot:
+                            triplets.append([current_act, current_slot, ''.join(current_value)])
+                        parts = label[2:].split('-')
+                        if len(parts) == 2:
+                            current_act, current_slot = parts
+                            current_value = [tokens[idx]]
+                    elif label.startswith("I-") and current_act and current_slot:  # 继续当前的 act-slot
+                        current_value.append(tokens[idx])
+                    elif label == "O" and current_act and current_slot:  # 结束当前 act-slot
+                        triplets.append([current_act, current_slot, ''.join(current_value)])
+                        current_act, current_slot = None, None
+                        current_value = []
+
+                # 确保最后一个 act-slot-value 被处理
+                if current_act and current_slot:
+                    triplets.append([current_act, current_slot, ''.join(current_value)])
+
+                predictions[did] = triplets
+
+    # 将预测结果保存到测试数据中
     test_json = json.load(open(test_path, 'r', encoding='utf-8'))
-    ptr = 0
     for ei, example in enumerate(test_json):
         for ui, utt in enumerate(example):
-            utt['pred'] = [pred.split('-') for pred in predictions[f"{ei}-{ui}"]]
-            ptr += 1
-    json.dump(test_json, open(os.path.join(args.dataroot, 'prediction.json'), 'w', encoding='utf-8'), indent=4, ensure_ascii=False)
+            utt_id = f"{ei}-{ui}"
+            if utt_id in predictions:
+                utt['pred'] = predictions[utt_id]
+
+    output_path = os.path.join(args.dataroot, 'prediction.json')
+    json.dump(test_json, open(output_path, 'w', encoding='utf-8'), indent=4, ensure_ascii=False)
+
 
 if not args.testing:
+    # 调用函数冻结前 N 层
+    freeze_bert_layers(model, freeze_layers=9)
+
+    # # 检查冻结情况
+    # for name, param in model.named_parameters():
+    #     print(f"{name}: {'trainable' if param.requires_grad else 'frozen'}")
     writer = SummaryWriter(log_dir="runs/slu_experiment")
     num_training_steps = ((len(train_dataset) + args.batch_size - 1) // args.batch_size) * args.max_epoch
     print('Total training steps: %d' % (num_training_steps))

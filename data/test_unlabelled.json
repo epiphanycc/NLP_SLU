@@ -26,7 +26,7 @@
     [
         {
             "utt_id": 1,
-            "asr_1best": "上海交通大学",
+            "asr_1best": "济南中虹市场哈哈",
             "semantic": [],
             "pred": []
         }
@@ -34,7 +34,7 @@
     [
         {
             "utt_id": 1,
-            "asr_1best": "上海交通大学宿舍楼",
+            "asr_1best": "导航到哈哈一大学",
             "semantic": [],
             "pred": []
         }

@@ -59,7 +59,7 @@ def freeze_bert_layers(model, freeze_layers=10):
 
 
 if args.testing:
-    check_point = torch.load(open('model1.bin', 'rb'), map_location=device)
+    check_point = torch.load(open('model_bert_best.bin', 'rb'), map_location=device)
     model.load_state_dict(check_point['model'])
     print("Load saved model from root path")
 
@@ -284,8 +284,8 @@ if not args.testing:
 
     print('FINAL BEST RESULT: \tEpoch: %d\tDev loss: %.4f\tDev acc: %.4f\tDev fscore(p/r/f): (%.4f/%.4f/%.4f)' % (best_result['iter'], best_result['dev_loss'], best_result['dev_acc'], best_result['dev_f1']['precision'], best_result['dev_f1']['recall'], best_result['dev_f1']['fscore']))
 else:
-    start_time = time.time()
-    metrics, dev_loss = decode('dev')
-    dev_acc, dev_fscore = metrics['acc'], metrics['fscore']
+    # start_time = time.time()
+    # metrics, dev_loss = decode('dev')
+    # dev_acc, dev_fscore = metrics['acc'], metrics['fscore']
     predict()
-    print("Evaluation costs %.2fs ; Dev loss: %.4f\tDev acc: %.2f\tDev fscore(p/r/f): (%.2f/%.2f/%.2f)" % (time.time() - start_time, dev_loss, dev_acc, dev_fscore['precision'], dev_fscore['recall'], dev_fscore['fscore']))
+    # print("Evaluation costs %.2fs ; Dev loss: %.4f\tDev acc: %.2f\tDev fscore(p/r/f): (%.2f/%.2f/%.2f)" % (time.time() - start_time, dev_loss, dev_acc, dev_fscore['precision'], dev_fscore['recall'], dev_fscore['fscore']))

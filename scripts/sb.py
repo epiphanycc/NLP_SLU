@@ -33,8 +33,15 @@ print("Dataset size: train -> %d ; dev -> %d" % (len(train_dataset), len(dev_dat
 import torch.nn as nn
 from transformers import BertModel, BertForTokenClassification
 class CustomBertWithGRUForTokenClassification(BertForTokenClassification):
-    def __init__(self, config, num_labels, gru_hidden_size=256, gru_layers=1):
+    def __init__(self, config, num_labels, type):
         super().__init__(config)
+        default_network_config = {
+            'input_size': config.hidden_size,
+            'hidden_size': 256,
+            'num_layers': 1,
+            'batch_first': True,
+            'bidirectional': False,
+        }
         
         # 使用 BERT 的预训练部分
         self.bert = BertModel(config)
@@ -43,15 +50,16 @@ class CustomBertWithGRUForTokenClassification(BertForTokenClassification):
         for param in self.bert.parameters():
             param.requires_grad = False
         
-        # GRU 层
-        self.gru = nn.GRU(input_size=config.hidden_size, 
-                            hidden_size=gru_hidden_size, 
-                            num_layers=gru_layers, 
-                            batch_first=True, 
-                            bidirectional=False)  # 单向GRU
-        
+        #根据需求
+        if type == 'GRU':
+            self.net = nn.GRU(**default_network_config)
+        elif type == 'LSTM':
+            self.net = nn.LSTM(**default_network_config)
+        elif type == 'RNN':
+            self.net = nn.RNN(**default_network_config)
+
         # 自定义分类层
-        self.custom_classifier = nn.Linear(gru_hidden_size, num_labels)
+        self.custom_classifier = nn.Linear(default_network_config['hidden_size'], num_labels)
         
     def forward(self, input_ids=None, attention_mask=None, token_type_ids=None, labels=None):
         # 获取 BERT 的输出
@@ -62,10 +70,10 @@ class CustomBertWithGRUForTokenClassification(BertForTokenClassification):
         sequence_output = outputs[0]  # 形状 [batch_size, seq_length, hidden_size]
         
         # 将 BERT 的输出传递到 GRU 层
-        gru_output, _ = self.gru(sequence_output)  # gru_output 形状 [batch_size, seq_length, gru_hidden_size]
+        output, _ = self.net(sequence_output)  # gru_output 形状 [batch_size, seq_length, gru_hidden_size]
         
         # 使用 GRU 的输出作为输入到自定义分类层
-        logits = self.custom_classifier(gru_output)  # logits 形状 [batch_size, seq_length, num_labels]
+        logits = self.custom_classifier(output)  # logits 形状 [batch_size, seq_length, num_labels]
         
         # 如果有标签，计算损失
         loss = None
@@ -83,18 +91,39 @@ from transformers import BertConfig
 # 假设你有一个 BERT 的配置文件和一些参数
 config = BertConfig.from_pretrained("bert-base-uncased")
 tokenizer = BertTokenizer.from_pretrained(bert_model_path)
-model = CustomBertWithGRUForTokenClassification(config, num_labels = Example.label_vocab.num_tags).to(device)
 
+model = CustomBertWithGRUForTokenClassification(config, num_labels = Example.label_vocab.num_tags, type = args.encoder_cell).to(device)
+
+def freeze_bert_layers(model, freeze_layers=10):
+    """
+    冻结 BERT 模型的前 `freeze_layers` 层的参数
+    """
+    # 遍历 BERT 编码器的所有层
+    for name, param in model.bert.encoder.layer.named_parameters():
+        layer_idx = int(name.split('.')[0])  # 获取层编号
+        if layer_idx < freeze_layers:
+            param.requires_grad = False  # 冻结参数
+        else:
+            param.requires_grad = True   # 保留可训练参数
+
+    # 冻结 BERT embedding 层（通常不需要微调）
+    for param in model.bert.embeddings.parameters():
+        param.requires_grad = False
 
 if args.testing:
     check_point = torch.load(open('model1.bin', 'rb'), map_location=device)
     model.load_state_dict(check_point['model'])
     print("Load saved model from root path")
 
-def set_optimizer(model):
+def set_optimizer(model, args):
     import torch.optim as optim
     # 定义优化器，仅优化 GRU 和分类层的参数
-    optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=1e-3)
+    if args.eztrain:
+        optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=1e-3)
+    else:
+        params = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
+        grouped_params = [{'params': list(set([p for n, p in params]))}]
+        optimizer = AdamW(grouped_params, lr=args.lr, weight_decay= 0.01)
     scheduler = StepLR(optimizer, step_size=8, gamma=0.5)
     return optimizer, scheduler
 
@@ -256,12 +285,14 @@ def predict():
 
 
 if not args.testing:
+    if not args.eztrain:
+        freeze_bert_layers(model, freeze_layers=9)
 
     writer = SummaryWriter(log_dir="runs/slu_experiment")
     num_training_steps = ((len(train_dataset) + args.batch_size - 1) // args.batch_size) * args.max_epoch
     ###
     print('Total training steps: %d' % (num_training_steps))
-    optimizer, scheduler = set_optimizer(model)
+    optimizer, scheduler = set_optimizer(model, args)
     nsamples, best_result = len(train_dataset), {'dev_acc': 0., 'dev_f1': 0.}
     train_index, step_size = np.arange(nsamples), args.batch_size
     print('Start training ......')
@@ -276,8 +307,13 @@ if not args.testing:
             cur_dataset = [train_dataset[k] for k in train_index[j: j + step_size]]
             input_ids, attention_masks, label_ids = encode_batch(cur_dataset, tokenizer, args.max_seq_len)
             input_ids, attention_masks, label_ids = input_ids.to(device), attention_masks.to(device), label_ids.to(device)
-
-            loss, logits = model(input_ids, attention_mask=attention_masks, labels=label_ids)
+            
+            if not args.eztrain:
+                outputs = model(input_ids, attention_mask=attention_masks, labels=label_ids)
+                loss = outputs.loss
+            else:
+                loss, _ = model(input_ids, attention_mask=attention_masks, labels=label_ids)
+            
             epoch_loss += loss.item()
             optimizer.zero_grad()
             loss.backward()

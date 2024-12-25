@@ -308,11 +308,11 @@ if not args.testing:
             input_ids, attention_masks, label_ids = encode_batch(cur_dataset, tokenizer, args.max_seq_len)
             input_ids, attention_masks, label_ids = input_ids.to(device), attention_masks.to(device), label_ids.to(device)
             
+            outputs = model(input_ids, attention_mask=attention_masks, labels=label_ids)
             if not args.eztrain:
-                outputs = model(input_ids, attention_mask=attention_masks, labels=label_ids)
                 loss = outputs.loss
             else:
-                loss, _ = model(input_ids, attention_mask=attention_masks, labels=label_ids)
+                loss = outputs[0]
             
             epoch_loss += loss.item()
             optimizer.zero_grad()

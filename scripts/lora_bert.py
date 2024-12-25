@@ -1,11 +1,16 @@
 # coding: utf-8
 
 import sys, os, time, gc, json
+import numpy as np
+import torch
 from torch.optim import AdamW
 from transformers import BertTokenizer, BertForTokenClassification
+from transformers import get_scheduler
+from peft import get_peft_model, LoraConfig, TaskType
 from torch.nn.utils.rnn import pad_sequence
-from torch.optim.lr_scheduler import ReduceLROnPlateau
+from torch.utils.tensorboard import SummaryWriter
 from torch.optim.lr_scheduler import StepLR
+
 install_path = os.path.abspath(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.append(install_path)
 from utils.args import init_args
@@ -13,9 +18,8 @@ from utils.initialization import *
 from utils.example import Example
 from utils.batch import from_example_list
 from utils.vocab import PAD
-from torch.utils.tensorboard import SummaryWriter
 
-# initialization params, output path, logger, random seed and torch.device
+# Initialization params, output path, logger, random seed, and torch.device
 args = init_args(sys.argv[1:])
 set_random_seed(args.seed)
 device = set_torch_device(args.device)
@@ -23,6 +27,7 @@ print("Initialization finished ...")
 print("Random seed is set to %d" % (args.seed))
 print("Use GPU with index %s" % (args.device) if args.device >= 0 else "Use CPU as target torch device")
 
+# Load datasets
 start_time = time.time()
 train_path = os.path.join(args.dataroot, 'train.json')
 dev_path = os.path.join(args.dataroot, 'development.json')
@@ -40,34 +45,29 @@ model = BertForTokenClassification.from_pretrained(
     num_labels=Example.label_vocab.num_tags,
 ).to(device)
 
-# 冻结模型的部分参数
-def freeze_bert_layers(model, freeze_layers=10):
-    """
-    冻结 BERT 模型的前 `freeze_layers` 层的参数
-    """
-    # 遍历 BERT 编码器的所有层
-    for name, param in model.bert.encoder.layer.named_parameters():
-        layer_idx = int(name.split('.')[0])  # 获取层编号
-        if layer_idx < freeze_layers:
-            param.requires_grad = False  # 冻结参数
-        else:
-            param.requires_grad = True   # 保留可训练参数
-
-    # 冻结 BERT embedding 层（通常不需要微调）
-    for param in model.bert.embeddings.parameters():
-        param.requires_grad = False
-
+# LoRA configuration
+lora_config = LoraConfig(
+    task_type=TaskType.TOKEN_CLS,
+    inference_mode=False,
+    r=8,  # LoRA rank
+    lora_alpha=32,
+    lora_dropout=0.1
+)
+model = get_peft_model(model, lora_config)
 
 if args.testing:
-    check_point = torch.load(open('model_bert_best.bin', 'rb'), map_location=device)
-    model.load_state_dict(check_point['model'])
-    print("Load saved model from root path")
+    checkpoint = torch.load(open('model_lora.bin', 'rb'), map_location=device)
+    model.load_state_dict(checkpoint['model'])
+    print("Loaded saved model from root path")
 
 def set_optimizer(model, args):
-    params = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
-    grouped_params = [{'params': list(set([p for n, p in params]))}]
-    optimizer = AdamW(grouped_params, lr=args.lr, weight_decay= 0.01)
-    scheduler = StepLR(optimizer, step_size=8, gamma=0.5)
+    optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
+    scheduler = get_scheduler(
+        name="linear",
+        optimizer=optimizer,
+        num_warmup_steps=int(0.1 * ((len(train_dataset) // args.batch_size) * args.max_epoch)),
+        num_training_steps=((len(train_dataset) // args.batch_size) * args.max_epoch),
+    )
     return optimizer, scheduler
 
 def encode_batch(dataset, tokenizer, max_len):
@@ -80,7 +80,6 @@ def encode_batch(dataset, tokenizer, max_len):
         attention_masks.append(tokens["attention_mask"][0])
         labels.append(torch.tensor(label_ids, dtype=torch.long))
     return pad_sequence(input_ids, batch_first=True), pad_sequence(attention_masks, batch_first=True), pad_sequence(labels, batch_first=True)
-
 def decode(choice):
     assert choice in ['train', 'dev']
     model.eval()
@@ -225,23 +224,12 @@ def predict():
 
     output_path = os.path.join(args.dataroot, 'prediction.json')
     json.dump(test_json, open(output_path, 'w', encoding='utf-8'), indent=4, ensure_ascii=False)
-
-
 if not args.testing:
-    # 调用函数冻结前 N 层
-    freeze_bert_layers(model, freeze_layers=9)
-
-    # # 检查冻结情况
-    # for name, param in model.named_parameters():
-    #     print(f"{name}: {'trainable' if param.requires_grad else 'frozen'}")
-    writer = SummaryWriter(log_dir="runs/slu_experiment")
-    num_training_steps = ((len(train_dataset) + args.batch_size - 1) // args.batch_size) * args.max_epoch
-    print('Total training steps: %d' % (num_training_steps))
-    optimizer,scheduler = set_optimizer(model, args)
+    writer = SummaryWriter(log_dir="runs/slu_experiment_lora")
+    optimizer, scheduler = set_optimizer(model, args)
     nsamples, best_result = len(train_dataset), {'dev_acc': 0., 'dev_f1': 0.}
     train_index, step_size = np.arange(nsamples), args.batch_size
-    print('Start training ......')
-    loss_cnt = 0
+    print('Start training with LoRA ......')
     for i in range(args.max_epoch):
         start_time = time.time()
         epoch_loss = 0
@@ -257,23 +245,23 @@ if not args.testing:
             loss = outputs.loss
             epoch_loss += loss.item()
             loss.backward()
-            writer.add_scalar('Loss/train', loss , loss_cnt)
-            loss_cnt += 1
             optimizer.step()
+            scheduler.step()
             optimizer.zero_grad()
             count += 1
+
         print('Training: \tEpoch: %d\tTime: %.4f\tTraining Loss: %.4f' % (i, time.time() - start_time, epoch_loss / count))
         torch.cuda.empty_cache()
         gc.collect()
 
         start_time = time.time()
         metrics, dev_loss = decode('dev')
-        scheduler.step()
         dev_acc, dev_fscore = metrics['acc'], metrics['fscore']
         writer.add_scalar('Loss/dev', dev_loss, i)
         writer.add_scalar('Accuracy/dev', dev_acc, i)
-        writer.add_scalar('F1/dev', dev_fscore['fscore'], i)
-        print('Evaluation: \tEpoch: %d\tTime: %.4f\tDev acc: %.2f\tDev fscore(p/r/f): (%.2f/%.2f/%.2f)\tDev loss: %.4f' % (i, time.time() - start_time, dev_acc, dev_fscore['precision'], dev_fscore['recall'], dev_fscore['fscore'],dev_loss))
+        print('Evaluation: \tEpoch: %d\tTime: %.4f\tDev acc: %.2f\tDev fscore(p/r/f): (%.2f/%.2f/%.2f)\tDev loss: %.4f' % (
+            i, time.time() - start_time, dev_acc, dev_fscore['precision'], dev_fscore['recall'], dev_fscore['fscore'], dev_loss))
+
         if dev_acc > best_result['dev_acc']:
             best_result['dev_loss'], best_result['dev_acc'], best_result['dev_f1'], best_result['iter'] = dev_loss, dev_acc, dev_fscore, i
             torch.save({
@@ -284,8 +272,8 @@ if not args.testing:
 
     print('FINAL BEST RESULT: \tEpoch: %d\tDev loss: %.4f\tDev acc: %.4f\tDev fscore(p/r/f): (%.4f/%.4f/%.4f)' % (best_result['iter'], best_result['dev_loss'], best_result['dev_acc'], best_result['dev_f1']['precision'], best_result['dev_f1']['recall'], best_result['dev_f1']['fscore']))
 else:
-    # start_time = time.time()
-    # metrics, dev_loss = decode('dev')
-    # dev_acc, dev_fscore = metrics['acc'], metrics['fscore']
+    start_time = time.time()
+    metrics, dev_loss = decode('dev')
+    dev_acc, dev_fscore = metrics['acc'], metrics['fscore']
     predict()
-    # print("Evaluation costs %.2fs ; Dev loss: %.4f\tDev acc: %.2f\tDev fscore(p/r/f): (%.2f/%.2f/%.2f)" % (time.time() - start_time, dev_loss, dev_acc, dev_fscore['precision'], dev_fscore['recall'], dev_fscore['fscore']))
+    print("Evaluation costs %.2fs ; Dev loss: %.4f\tDev acc: %.2f\tDev fscore(p/r/f): (%.2f/%.2f/%.2f)" % (time.time() - start_time, dev_loss, dev_acc, dev_fscore['precision'], dev_fscore['recall'], dev_fscore['fscore']))

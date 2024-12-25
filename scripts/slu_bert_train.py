@@ -35,7 +35,7 @@ print("Dataset size: train -> %d ; dev -> %d" % (len(train_dataset), len(dev_dat
 bert_model_path = os.path.abspath(os.path.join(install_path, 'bert-base-chinese'))
 tokenizer = BertTokenizer.from_pretrained(bert_model_path)
 if args.eztrain == True:
-    config = BertConfig.from_pretrained("bert-base-uncased")
+    config = BertConfig.from_pretrained("bert-base-chinese")
     from model.slu_bert_withnet import CustomBertWithGRUForTokenClassification
     model = CustomBertWithGRUForTokenClassification(config, num_labels = Example.label_vocab.num_tags, type = args.encoder_cell).to(device)
 else:
@@ -99,7 +99,10 @@ def decode(choice):
             input_ids, attention_masks, label_ids = input_ids.to(device), attention_masks.to(device), label_ids.to(device)
 
             outputs = model(input_ids, attention_mask=attention_masks, labels=label_ids)
-            loss, logits = outputs.loss, outputs.logits
+            if not args.eztrain:
+                loss,logits = outputs.loss,outputs.logits
+            else:
+                loss,logits = outputs[0] ,outputs[1]
             predictions.extend(torch.argmax(logits, dim=-1).cpu().tolist())
             labels.extend(label_ids.cpu().tolist())
             total_loss += loss.item()

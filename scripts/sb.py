@@ -2,7 +2,7 @@
 
 import sys, os, time, gc, json
 from torch.optim import AdamW
-from transformers import BertTokenizer, BertForTokenClassification
+from transformers import BertTokenizer, BertForTokenClassification, BertConfig
 from torch.nn.utils.rnn import pad_sequence
 from torch.optim.lr_scheduler import StepLR
 install_path = os.path.abspath(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -30,69 +30,17 @@ dev_dataset = Example.load_dataset(dev_path)
 print("Load dataset and database finished, cost %.4fs ..." % (time.time() - start_time))
 print("Dataset size: train -> %d ; dev -> %d" % (len(train_dataset), len(dev_dataset)))
 
-import torch.nn as nn
-from transformers import BertModel, BertForTokenClassification
-class CustomBertWithGRUForTokenClassification(BertForTokenClassification):
-    def __init__(self, config, num_labels, type):
-        super().__init__(config)
-        default_network_config = {
-            'input_size': config.hidden_size,
-            'hidden_size': 256,
-            'num_layers': 1,
-            'batch_first': True,
-            'bidirectional': False,
-        }
-        
-        # 使用 BERT 的预训练部分
-        self.bert = BertModel(config)
-        
-        # 冻结 BERT 的所有参数
-        for param in self.bert.parameters():
-            param.requires_grad = False
-        
-        #根据需求
-        if type == 'GRU':
-            self.net = nn.GRU(**default_network_config)
-        elif type == 'LSTM':
-            self.net = nn.LSTM(**default_network_config)
-        elif type == 'RNN':
-            self.net = nn.RNN(**default_network_config)
-
-        # 自定义分类层
-        self.custom_classifier = nn.Linear(default_network_config['hidden_size'], num_labels)
-        
-    def forward(self, input_ids=None, attention_mask=None, token_type_ids=None, labels=None):
-        # 获取 BERT 的输出
-        with torch.no_grad():  # 确保 BERT 在前向传播中不计算梯度
-            outputs = self.bert(input_ids=input_ids, attention_mask=attention_mask, token_type_ids=token_type_ids)
-        
-        # BERT 的最后隐藏状态
-        sequence_output = outputs[0]  # 形状 [batch_size, seq_length, hidden_size]
-        
-        # 将 BERT 的输出传递到 GRU 层
-        output, _ = self.net(sequence_output)  # gru_output 形状 [batch_size, seq_length, gru_hidden_size]
-        
-        # 使用 GRU 的输出作为输入到自定义分类层
-        logits = self.custom_classifier(output)  # logits 形状 [batch_size, seq_length, num_labels]
-        
-        # 如果有标签，计算损失
-        loss = None
-        if labels is not None:
-            # 计算损失（通常是交叉熵损失）
-            loss_fct = nn.CrossEntropyLoss()
-            loss = loss_fct(logits.view(-1, logits.shape[-1]), labels.view(-1))
-
-        return (loss, logits) if loss is not None else (logits,)
-
 
 # Load pre-trained BERT model and tokenizer
 bert_model_path = os.path.abspath(os.path.join(install_path, 'bert-base-chinese'))
-from transformers import BertConfig
-# 假设你有一个 BERT 的配置文件和一些参数
-config = BertConfig.from_pretrained("bert-base-uncased")
 tokenizer = BertTokenizer.from_pretrained(bert_model_path)
-
-model = CustomBertWithGRUForTokenClassification(config, num_labels = Example.label_vocab.num_tags, type = args.encoder_cell).to(device)
+if args.eztrain == True:
+    config = BertConfig.from_pretrained("bert-base-uncased")
+    from model.slu_bert_withnet import CustomBertWithGRUForTokenClassification
+    model = CustomBertWithGRUForTokenClassification(config, num_labels = Example.label_vocab.num_tags, type = args.encoder_cell).to(device)
+else:
+    model = BertForTokenClassification.from_pretrained(
+    bert_model_path,num_labels=Example.label_vocab.num_tags,).to(device)
 
 def freeze_bert_layers(model, freeze_layers=10):
     """
@@ -285,7 +233,7 @@ def predict():
 
 
 if not args.testing:
-    if not args.eztrain:
+    if args.eztrain == False:
         freeze_bert_layers(model, freeze_layers=9)
 
     writer = SummaryWriter(log_dir="runs/slu_experiment")

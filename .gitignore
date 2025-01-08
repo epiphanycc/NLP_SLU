@@ -1,0 +1,4 @@
+*.pyc
+base-bert-uncased*
+*.bin
+events*

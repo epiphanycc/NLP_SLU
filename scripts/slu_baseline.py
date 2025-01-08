@@ -5,7 +5,6 @@ from torch.optim import Adam
 
 install_path = os.path.abspath(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.append(install_path)
-
 from utils.args import init_args
 from utils.initialization import *
 from utils.example import Example
@@ -89,7 +88,8 @@ def predict():
             for pi, p in enumerate(pred):
                 did = current_batch.did[pi]
                 predictions[did] = p
-    test_json = json.load(open(test_path, 'r'))
+
+    test_json = json.load(open(test_path, 'r',encoding='utf-8'))
     ptr = 0
     for ei, example in enumerate(test_json):
         for ui, utt in enumerate(example):

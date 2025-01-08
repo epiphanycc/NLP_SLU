@@ -56,7 +56,7 @@ lora_config = LoraConfig(
 model = get_peft_model(model, lora_config)
 
 if args.testing:
-    checkpoint = torch.load(open('model_lora.bin', 'rb'), map_location=device)
+    checkpoint = torch.load(open('model_lora_8391.bin', 'rb'), map_location=device)
     model.load_state_dict(checkpoint['model'])
     print("Loaded saved model from root path")
 

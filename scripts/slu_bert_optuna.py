@@ -1,20 +1,17 @@
-# coding: utf-8
-
 import sys, os, time, gc, json
 from torch.optim import AdamW
-from transformers import BertTokenizer, BertForTokenClassification
+from transformers import BertTokenizer, BertForTokenClassification, BertConfig
 from torch.nn.utils.rnn import pad_sequence
-from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.optim.lr_scheduler import StepLR
 install_path = os.path.abspath(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.append(install_path)
 from utils.args import init_args
 from utils.initialization import *
 from utils.example import Example
-from utils.batch import from_example_list
 from utils.vocab import PAD
 from torch.utils.tensorboard import SummaryWriter
-
+import optuna
+from transformers import get_scheduler
 # initialization params, output path, logger, random seed and torch.device
 args = init_args(sys.argv[1:])
 set_random_seed(args.seed)
@@ -32,43 +29,9 @@ dev_dataset = Example.load_dataset(dev_path)
 print("Load dataset and database finished, cost %.4fs ..." % (time.time() - start_time))
 print("Dataset size: train -> %d ; dev -> %d" % (len(train_dataset), len(dev_dataset)))
 
-# Load pre-trained BERT model and tokenizer
-bert_model_path = os.path.abspath(os.path.join(install_path, 'bert-base-chinese'))
-tokenizer = BertTokenizer.from_pretrained(bert_model_path)
-model = BertForTokenClassification.from_pretrained(
-    bert_model_path,
-    num_labels=Example.label_vocab.num_tags,
-).to(device)
-
-# 冻结模型的部分参数
-def freeze_bert_layers(model, freeze_layers=10):
-    """
-    冻结 BERT 模型的前 `freeze_layers` 层的参数
-    """
-    # 遍历 BERT 编码器的所有层
-    for name, param in model.bert.encoder.layer.named_parameters():
-        layer_idx = int(name.split('.')[0])  # 获取层编号
-        if layer_idx < freeze_layers:
-            param.requires_grad = False  # 冻结参数
-        else:
-            param.requires_grad = True   # 保留可训练参数
-
-    # 冻结 BERT embedding 层（通常不需要微调）
-    for param in model.bert.embeddings.parameters():
-        param.requires_grad = False
 
 
-if args.testing:
-    check_point = torch.load(open('model_bert_best.bin', 'rb'), map_location=device)
-    model.load_state_dict(check_point['model'])
-    print("Load saved model from root path")
-
-def set_optimizer(model, args):
-    params = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
-    grouped_params = [{'params': list(set([p for n, p in params]))}]
-    optimizer = AdamW(grouped_params, lr=args.lr, weight_decay= 0.01)
-    scheduler = StepLR(optimizer, step_size=8, gamma=0.5)
-    return optimizer, scheduler
+    
 
 def encode_batch(dataset, tokenizer, max_len):
     input_ids, attention_masks, labels = [], [], []
@@ -81,7 +44,7 @@ def encode_batch(dataset, tokenizer, max_len):
         labels.append(torch.tensor(label_ids, dtype=torch.long))
     return pad_sequence(input_ids, batch_first=True), pad_sequence(attention_masks, batch_first=True), pad_sequence(labels, batch_first=True)
 
-def decode(choice):
+def decode(choice,model,tokenizer):
     assert choice in ['train', 'dev']
     model.eval()
     dataset = train_dataset if choice == 'train' else dev_dataset
@@ -94,7 +57,10 @@ def decode(choice):
             input_ids, attention_masks, label_ids = input_ids.to(device), attention_masks.to(device), label_ids.to(device)
 
             outputs = model(input_ids, attention_mask=attention_masks, labels=label_ids)
-            loss, logits = outputs.loss, outputs.logits
+            if not args.eztrain:
+                loss,logits = outputs.loss,outputs.logits
+            else:
+                loss,logits = outputs[0] ,outputs[1]
             predictions.extend(torch.argmax(logits, dim=-1).cpu().tolist())
             labels.extend(label_ids.cpu().tolist())
             total_loss += loss.item()
@@ -160,7 +126,7 @@ def decode(choice):
     gc.collect()
     return metrics, total_loss / count
 
-def predict():
+def predict(model,tokenizer):
     
     model.eval()
     test_path = os.path.join(args.dataroot, 'test_unlabelled.json')
@@ -226,66 +192,140 @@ def predict():
     output_path = os.path.join(args.dataroot, 'prediction.json')
     json.dump(test_json, open(output_path, 'w', encoding='utf-8'), indent=4, ensure_ascii=False)
 
+def freeze_bert_layers(model, freeze_layers=10):
+    """
+    冻结 BERT 模型的前 `freeze_layers` 层的参数
+    """
+    # 遍历 BERT 编码器的所有层
+    for name, param in model.bert.encoder.layer.named_parameters():
+        layer_idx = int(name.split('.')[0])  # 获取层编号
+        if layer_idx < freeze_layers:
+            param.requires_grad = False  # 冻结参数
+        else:
+            param.requires_grad = True   # 保留可训练参数
 
-if not args.testing:
-    # 调用函数冻结前 N 层
-    freeze_bert_layers(model, freeze_layers=9)
+    # 冻结 BERT embedding 层（通常不需要微调）
+    for param in model.bert.embeddings.parameters():
+        param.requires_grad = False
 
-    # # 检查冻结情况
-    # for name, param in model.named_parameters():
-    #     print(f"{name}: {'trainable' if param.requires_grad else 'frozen'}")
-    writer = SummaryWriter(log_dir="runs/slu_experiment")
-    num_training_steps = ((len(train_dataset) + args.batch_size - 1) // args.batch_size) * args.max_epoch
-    print('Total training steps: %d' % (num_training_steps))
-    optimizer,scheduler = set_optimizer(model, args)
-    nsamples, best_result = len(train_dataset), {'dev_acc': 0., 'dev_f1': 0.}
-    train_index, step_size = np.arange(nsamples), args.batch_size
-    print('Start training ......')
-    loss_cnt = 0
-    for i in range(args.max_epoch):
-        start_time = time.time()
-        epoch_loss = 0
-        np.random.shuffle(train_index)
-        model.train()
-        count = 0
-        for j in range(0, nsamples, step_size):
-            cur_dataset = [train_dataset[k] for k in train_index[j: j + step_size]]
-            input_ids, attention_masks, label_ids = encode_batch(cur_dataset, tokenizer, args.max_seq_len)
-            input_ids, attention_masks, label_ids = input_ids.to(device), attention_masks.to(device), label_ids.to(device)
+def set_optimizer(model, lr, weight_decay, ratio):
+    import torch.optim as optim
+    params = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
+    grouped_params = [{'params': list(set([p for n, p in params]))}]
+    optimizer = AdamW(grouped_params, lr=lr, weight_decay=weight_decay)
+    scheduler = get_scheduler(
+        name="linear",
+        optimizer=optimizer,
+        num_warmup_steps=int(ratio * ((len(train_dataset) // args.batch_size) * args.max_epoch)),
+        num_training_steps=((len(train_dataset) // args.batch_size) * args.max_epoch),
+    )
+    return optimizer, scheduler
 
-            outputs = model(input_ids, attention_mask=attention_masks, labels=label_ids)
-            loss = outputs.loss
-            epoch_loss += loss.item()
-            loss.backward()
-            writer.add_scalar('Loss/train', loss , loss_cnt)
-            loss_cnt += 1
-            optimizer.step()
-            optimizer.zero_grad()
-            count += 1
-        print('Training: \tEpoch: %d\tTime: %.4f\tTraining Loss: %.4f' % (i, time.time() - start_time, epoch_loss / count))
-        torch.cuda.empty_cache()
-        gc.collect()
+# 目标函数：定义需要优化的超参数和模型训练过程
+def objective(trial):
+    """
+    目标函数：定义需要优化的超参数和模型训练过程
+    """
+    lr = trial.suggest_loguniform('lr', 5e-6, 3e-2)  # 学习率范围
+    # freeze_layers = trial.suggest_int('freeze_layers', 8, 8)  # 冻结的 BERT 层数
+    batch_size = trial.suggest_int('batch_size', 8, 48, step=8)  # 批次大小
+    max_epoch = trial.suggest_int('max_epoch', 10, 25)  # 最大训练 epoch 数
+    # step_size = trial.suggest_int('step_size', 5, 20)  # 调整 step_size 的值
+    # gamma = trial.suggest_uniform('gamma', 0.1, 0.9)  # 调整 gamma 的值
+    ratio = trial.suggest_uniform('gamma', 0, 0.2)  # 调整 ratio 的值
+    weight_decay = trial.suggest_loguniform('weight_decay', 1e-5, 1e-2)
+    
+    
+    # Load pre-trained BERT model and tokenizer
+    bert_model_path = os.path.abspath(os.path.join(install_path, 'bert-base-chinese'))
+    tokenizer = BertTokenizer.from_pretrained(bert_model_path)
+    if args.eztrain == True:
+        config = BertConfig.from_pretrained("bert-base-chinese")
+        from model.slu_bert_withnet import CustomBertWithGRUForTokenClassification
+        model = CustomBertWithGRUForTokenClassification(config, num_labels = Example.label_vocab.num_tags, type = args.encoder_cell).to(device)
+    else:
+        model = BertForTokenClassification.from_pretrained(
+        bert_model_path, num_labels=Example.label_vocab.num_tags).to(device)
+        
+    # 根据 Optuna 中的超参数冻结层
+    freeze_bert_layers(model, freeze_layers=8)
 
-        start_time = time.time()
-        metrics, dev_loss = decode('dev')
-        scheduler.step()
-        dev_acc, dev_fscore = metrics['acc'], metrics['fscore']
-        writer.add_scalar('Loss/dev', dev_loss, i)
-        writer.add_scalar('Accuracy/dev', dev_acc, i)
-        writer.add_scalar('F1/dev', dev_fscore['fscore'], i)
-        print('Evaluation: \tEpoch: %d\tTime: %.4f\tDev acc: %.2f\tDev fscore(p/r/f): (%.2f/%.2f/%.2f)\tDev loss: %.4f' % (i, time.time() - start_time, dev_acc, dev_fscore['precision'], dev_fscore['recall'], dev_fscore['fscore'],dev_loss))
-        if dev_acc > best_result['dev_acc']:
-            best_result['dev_loss'], best_result['dev_acc'], best_result['dev_f1'], best_result['iter'] = dev_loss, dev_acc, dev_fscore, i
-            torch.save({
-                'epoch': i, 'model': model.state_dict(),
-                'optim': optimizer.state_dict(),
-            }, open('model.bin', 'wb'))
-            print('NEW BEST MODEL: \tEpoch: %d\tDev loss: %.4f\tDev acc: %.2f\tDev fscore(p/r/f): (%.2f/%.2f/%.2f)' % (i, dev_loss, dev_acc, dev_fscore['precision'], dev_fscore['recall'], dev_fscore['fscore']))
+    writer = SummaryWriter(log_dir="runs/slu_experiment_optuna")
+    nsamples, step_size = len(train_dataset), batch_size
+    best_result = {'dev_acc': 0., 'dev_f1': 0.}
 
-    print('FINAL BEST RESULT: \tEpoch: %d\tDev loss: %.4f\tDev acc: %.4f\tDev fscore(p/r/f): (%.4f/%.4f/%.4f)' % (best_result['iter'], best_result['dev_loss'], best_result['dev_acc'], best_result['dev_f1']['precision'], best_result['dev_f1']['recall'], best_result['dev_f1']['fscore']))
-else:
-    start_time = time.time()
-    metrics, dev_loss = decode('dev')
-    dev_acc, dev_fscore = metrics['acc'], metrics['fscore']
-    predict()
-    print("Evaluation costs %.2fs ; Dev loss: %.4f\tDev acc: %.2f\tDev fscore(p/r/f): (%.2f/%.2f/%.2f)" % (time.time() - start_time, dev_loss, dev_acc, dev_fscore['precision'], dev_fscore['recall'], dev_fscore['fscore']))
+    # 训练模型
+    if not args.testing:
+
+        writer = SummaryWriter(log_dir="runs/slu_experiment")
+        num_training_steps = ((len(train_dataset) + args.batch_size - 1) // args.batch_size) * args.max_epoch
+        ###
+        print('Total training steps: %d' % (num_training_steps))
+        optimizer, scheduler = set_optimizer(model, lr ,weight_decay,ratio)
+        nsamples, best_result = len(train_dataset), {'dev_acc': 0., 'dev_f1': 0.}
+        train_index, step_size = np.arange(nsamples), args.batch_size
+        print('Start training ......')
+        loss_cnt = 0
+        for i in range(max_epoch):
+            start_time = time.time()
+            epoch_loss = 0
+            np.random.shuffle(train_index)
+            model.train()
+            count = 0
+            for j in range(0, nsamples, step_size):
+                cur_dataset = [train_dataset[k] for k in train_index[j: j + step_size]]
+                input_ids, attention_masks, label_ids = encode_batch(cur_dataset, tokenizer, args.max_seq_len)
+                input_ids, attention_masks, label_ids = input_ids.to(device), attention_masks.to(device), label_ids.to(device)
+                
+                outputs = model(input_ids, attention_mask=attention_masks, labels=label_ids)
+                if not args.eztrain:
+                    loss = outputs.loss
+                else:
+                    loss = outputs[0]
+                
+                epoch_loss += loss.item()
+                optimizer.zero_grad()
+                loss.backward()
+                writer.add_scalar('Loss/train', loss , loss_cnt)
+                loss_cnt += 1
+                optimizer.step()
+                count += 1
+            print('Training: \tEpoch: %d\tTime: %.4f\tTraining Loss: %.4f' % (i, time.time() - start_time, epoch_loss / count))
+            torch.cuda.empty_cache()
+            gc.collect()
+
+            start_time = time.time()
+            metrics, dev_loss = decode('dev',model,tokenizer)
+            scheduler.step()
+            dev_acc, dev_fscore = metrics['acc'], metrics['fscore']
+            writer.add_scalar('Loss/dev', dev_loss, i)
+            writer.add_scalar('Accuracy/dev', dev_acc, i)
+            writer.add_scalar('F1/dev', dev_fscore['fscore'], i)
+            print('Evaluation: \tEpoch: %d\tTime: %.4f\tDev acc: %.2f\tDev fscore(p/r/f): (%.2f/%.2f/%.2f)\tDev loss: %.4f' % (i, time.time() - start_time, dev_acc, dev_fscore['precision'], dev_fscore['recall'], dev_fscore['fscore'],dev_loss))
+            if dev_acc > best_result['dev_acc']:
+                best_result['dev_loss'], best_result['dev_acc'], best_result['dev_f1'], best_result['iter'] = dev_loss, dev_acc, dev_fscore, i
+                torch.save({
+                    'epoch': i, 'model': model.state_dict(),
+                    'optim': optimizer.state_dict(),
+                }, open('model.bin', 'wb'))
+                print('NEW BEST MODEL: \tEpoch: %d\tDev loss: %.4f\tDev acc: %.2f\tDev fscore(p/r/f): (%.2f/%.2f/%.2f)' % (i, dev_loss, dev_acc, dev_fscore['precision'], dev_fscore['recall'], dev_fscore['fscore']))
+
+        print('FINAL BEST RESULT: \tEpoch: %d\tDev loss: %.4f\tDev acc: %.4f\tDev fscore(p/r/f): (%.4f/%.4f/%.4f)' % (best_result['iter'], best_result['dev_loss'], best_result['dev_acc'], best_result['dev_f1']['precision'], best_result['dev_f1']['recall'], best_result['dev_f1']['fscore']))
+    return best_result['dev_acc']
+
+
+# 创建 Optuna study
+study = optuna.create_study(direction='maximize')
+
+# 运行优化
+study.optimize(objective, n_trials=10)  # 试验次数（根据需要调整）
+
+# 输出优化结果
+print(f"Best trial: {study.best_trial.number}")
+print(f"Best value: {study.best_value}")
+print(f"Best parameters: {study.best_params}")
+
+
+optuna.visualization.plot_param_importances(study).show()
+optuna.visualization.plot_optimization_history(study).show()
+optuna.visualization.plot_slice(study).show()

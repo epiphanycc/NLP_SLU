@@ -59,7 +59,7 @@ def freeze_bert_layers(model, freeze_layers=10):
         param.requires_grad = False
 
 if args.testing:
-    check_point = torch.load(open('model1.bin', 'rb'), map_location=device)
+    check_point = torch.load(open('model_bert_best.bin', 'rb'), map_location=device)
     model.load_state_dict(check_point['model'])
     print("Load saved model from root path")
 
@@ -67,7 +67,7 @@ def set_optimizer(model, args):
     import torch.optim as optim
     # 定义优化器，仅优化 GRU 和分类层的参数
     if args.eztrain:
-        optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=1e-3)
+        optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=1e-3)
     else:
         params = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
         grouped_params = [{'params': list(set([p for n, p in params]))}]

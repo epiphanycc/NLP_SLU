@@ -202,6 +202,7 @@ def objective(trial):
     ratio = trial.suggest_uniform('gamma', 0, 0.2)  # 调整 ratio 的值
     weight_decay = trial.suggest_loguniform('weight_decay', 1e-5, 1e-2)
     
+    custom_loss_weight = (5.0, 3.0, 1.0)
     
     # Load pre-trained BERT model and tokenizer
     bert_model_path = os.path.abspath(os.path.join(install_path, 'bert-base-chinese'))
@@ -209,7 +210,7 @@ def objective(trial):
     if args.eztrain == True:
         config = BertConfig.from_pretrained("bert-base-chinese")
         from model.slu_bert_withnet import CustomBertMultiHeadForTokenClassification
-        model = CustomBertMultiHeadForTokenClassification(config, num_labels_list = output_dim, type = args.encoder_cell).to(device)
+        model = CustomBertMultiHeadForTokenClassification(config, num_labels_list = output_dim, type = args.encoder_cell, custom_loss_weight = custom_loss_weight).to(device)
     else:
         model = BertForTokenClassification.from_pretrained(
         bert_model_path, num_labels=Example.label_vocab.num_tags).to(device)

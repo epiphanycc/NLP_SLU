@@ -54,7 +54,7 @@ class CustomBertWithGRUForTokenClassification(BertForTokenClassification):
         return (loss, logits) if loss is not None else (logits,)
 
 class CustomBertMultiHeadForTokenClassification(BertForTokenClassification):
-    def __init__(self, config, num_labels_list, type):
+    def __init__(self, config, num_labels_list, type, custom_loss_weight):
         super().__init__(config)
         default_network_config = {
             'input_size': config.hidden_size,
@@ -83,6 +83,8 @@ class CustomBertMultiHeadForTokenClassification(BertForTokenClassification):
         self.custom_classifier_0 = nn.Linear(default_network_config['hidden_size'], num_labels_list[0])
         self.custom_classifier_1 = nn.Linear(default_network_config['hidden_size'], num_labels_list[1])
         self.custom_classifier_2 = nn.Linear(default_network_config['hidden_size'], num_labels_list[2])
+
+        self.custom_loss_weight = custom_loss_weight
         
     def forward(self, input_ids=None, attention_mask=None, token_type_ids=None, labels=None):
         # Get BERT's output with no gradient computation
@@ -118,7 +120,7 @@ class CustomBertMultiHeadForTokenClassification(BertForTokenClassification):
                 # Extract labels for the i-th head
                 head_labels = labels[:, :, i]  # Shape [batch_size, seq_length]
                 # Calculate loss and accumulate it
-                loss += loss_fct(logits.view(-1, logits.shape[-1]), head_labels.view(-1))
+                loss += self.custom_loss_weight[i] * loss_fct(logits.view(-1, logits.shape[-1]), head_labels.view(-1))
         
         # Return loss and logits for each head
         return (loss, logits_list) if loss is not None else (logits_list,)

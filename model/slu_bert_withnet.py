@@ -9,7 +9,7 @@ class CustomBertWithGRUForTokenClassification(BertForTokenClassification):
             'hidden_size': 256,
             'num_layers': 1,
             'batch_first': True,
-            'bidirectional': False,
+            'bidirectional': True,
         }
         
         # 使用 BERT 的预训练部分
@@ -28,7 +28,7 @@ class CustomBertWithGRUForTokenClassification(BertForTokenClassification):
             self.net = nn.RNN(**default_network_config)
 
         # 自定义分类层
-        self.custom_classifier = nn.Linear(default_network_config['hidden_size'], num_labels)
+        self.custom_classifier = nn.Linear(default_network_config['hidden_size']*2, num_labels)
         
     def forward(self, input_ids=None, attention_mask=None, token_type_ids=None, labels=None):
         # 获取 BERT 的输出
@@ -52,3 +52,75 @@ class CustomBertWithGRUForTokenClassification(BertForTokenClassification):
             loss = loss_fct(logits.view(-1, logits.shape[-1]), labels.view(-1))
 
         return (loss, logits) if loss is not None else (logits,)
+
+class CustomBertMultiHeadForTokenClassification(BertForTokenClassification):
+    def __init__(self, config, num_labels_list, type, custom_loss_weight):
+        super().__init__(config)
+        default_network_config = {
+            'input_size': config.hidden_size,
+            'hidden_size': 256,
+            'num_layers': 1,
+            'batch_first': True,
+            'bidirectional': True,
+        }
+        
+        # 使用 BERT 的预训练部分
+        self.bert = BertModel(config)
+        
+        # 冻结 BERT 的所有参数
+        for param in self.bert.parameters():
+            param.requires_grad = False
+        
+        #根据需求
+        if type == 'GRU':
+            self.net = nn.GRU(**default_network_config)
+        elif type == 'LSTM':
+            self.net = nn.LSTM(**default_network_config)
+        elif type == 'RNN':
+            self.net = nn.RNN(**default_network_config)
+
+        # 自定义分类层
+        self.custom_classifier_0 = nn.Linear(default_network_config['hidden_size']*2, num_labels_list[0])
+        self.custom_classifier_1 = nn.Linear(default_network_config['hidden_size']*2, num_labels_list[1])
+        self.custom_classifier_2 = nn.Linear(default_network_config['hidden_size']*2, num_labels_list[2])
+
+        self.custom_loss_weight = custom_loss_weight
+        
+    def forward(self, input_ids=None, attention_mask=None, token_type_ids=None, labels=None):
+        # Get BERT's output with no gradient computation
+        with torch.no_grad():
+            outputs = self.bert(input_ids=input_ids, attention_mask=attention_mask, token_type_ids=token_type_ids)
+        
+        # The last hidden state from BERT
+        sequence_output = outputs[0]  # Shape [batch_size, seq_length, hidden_size]
+        
+        # Pass BERT's output to the GRU/LSTM/RNN layer
+        output, _ = self.net(sequence_output)  # Shape [batch_size, seq_length, hidden_size]
+        
+        # Initialize an empty list to store logits for each head
+        """logits_list = []
+        
+        # Compute logits for each head
+        for classifier in self.custom_classifier_list:
+            logits = classifier(output)  # Shape [batch_size, seq_length, num_labels_for_this_head]
+            logits_list.append(logits)"""
+        logits_list = [
+            self.custom_classifier_0(output),
+            self.custom_classifier_1(output),
+            self.custom_classifier_2(output)
+        ]
+
+        # Initialize the loss to None
+        loss = None
+        if labels is not None:
+            # Compute the loss for each head
+            loss_fct = nn.CrossEntropyLoss()
+            loss = 0  # Initialize loss to zero
+            for i, logits in enumerate(logits_list):
+                # Extract labels for the i-th head
+                head_labels = labels[:, :, i]  # Shape [batch_size, seq_length]
+                # Calculate loss and accumulate it
+                loss += self.custom_loss_weight[i] * loss_fct(logits.view(-1, logits.shape[-1]), head_labels.view(-1))
+        
+        # Return loss and logits for each head
+        return (loss, logits_list) if loss is not None else (logits_list,)

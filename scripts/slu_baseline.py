@@ -40,7 +40,7 @@ model = SLUTagging(args).to(device)
 Example.word2vec.load_embeddings(model.word_embed, Example.word_vocab, device=device)
 
 if args.testing:
-    check_point = torch.load(open('model.bin', 'rb'), map_location=device)
+    check_point = torch.load(open('model_RNN_baseline.bin', 'rb'), map_location=device)
     model.load_state_dict(check_point['model'])
     print("Load saved model from root path")
 

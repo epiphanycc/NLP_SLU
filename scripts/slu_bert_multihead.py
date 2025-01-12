@@ -12,7 +12,6 @@ from utils.vocab import PAD
 from torch.utils.tensorboard import SummaryWriter
 import optuna
 from transformers import get_scheduler
-from optuna.visualization import plot_param_importances, plot_optimization_history, plot_slice
 # initialization params, output path, logger, random seed and torch.device
 args = init_args(sys.argv[1:])
 set_random_seed(args.seed)
@@ -31,15 +30,45 @@ print("Load dataset and database finished, cost %.4fs ..." % (time.time() - star
 print("Dataset size: train -> %d ; dev -> %d" % (len(train_dataset), len(dev_dataset)))
 
 
+def make_new_table():
+    part0_list = ["O"]
+    part1_list = ["O"]
+    part2_list = ["O"]
+    tag2idx = {}
+    idx2tag = {}
+    for value in Example.label_vocab.idx2tag.values():
+        if value == PAD or value == "O":
+            continue
+        part0, part1, part2 = value.split("-")
+        if part0 not in part0_list:
+            part0_list.append(part0)
+        if part1 not in part1_list:
+            part1_list.append(part1)
+        if part2 not in part2_list:
+            part2_list.append(part2)
+        key = (part0_list.index(part0), part1_list.index(part1), part2_list.index(part2))
+        tag2idx[value] = key
+        idx2tag[key] = value
+    dim = (len(part0_list), len(part1_list), len(part2_list))
+    tag2idx[PAD] = (0, 0, 0)
+    tag2idx["O"] = (0, 0, 0)
+    for i in range(dim[0]):
+        for j in range(dim[1]):
+            for k in range(dim[2]):
+                if i == 0 or j == 0 or k == 0:
+                    idx2tag[(i, j, k)] = "O"
+    return tag2idx, idx2tag, dim
 
-    
+convert_tag_to_idx, convert_idx_to_tag, output_dim = make_new_table()
+
+#print(convert_tag_to_idx, convert_idx_to_tag, output_dim)
 
 def encode_batch(dataset, tokenizer, max_len):
     input_ids, attention_masks, labels = [], [], []
     for example in dataset:
         tokens = tokenizer(example.utt, truncation=True, padding='max_length', max_length=max_len, return_tensors="pt")
-        label_ids = [Example.label_vocab.convert_tag_to_idx(tag) for tag in example.tags]
-        label_ids = label_ids[:max_len] + [Example.label_vocab.convert_tag_to_idx(PAD)] * (max_len - len(label_ids))
+        label_ids = [list(convert_tag_to_idx[tag]) for tag in example.tags]
+        label_ids = label_ids[:max_len] + [list(convert_tag_to_idx[PAD])] * (max_len - len(label_ids))
         input_ids.append(tokens["input_ids"][0])
         attention_masks.append(tokens["attention_mask"][0])
         labels.append(torch.tensor(label_ids, dtype=torch.long))
@@ -62,7 +91,10 @@ def decode(choice,model,tokenizer):
                 loss,logits = outputs.loss,outputs.logits
             else:
                 loss,logits = outputs[0] ,outputs[1]
-            predictions.extend(torch.argmax(logits, dim=-1).cpu().tolist())
+            outputs = torch.stack([torch.argmax(l, dim=-1) for l in logits], dim=-1).cpu().tolist()
+            #outputs = [[tuple(y) for y in x] for x in outputs]
+            #print(outputs)
+            predictions.extend(outputs)
             labels.extend(label_ids.cpu().tolist())
             total_loss += loss.item()
             count += 1
@@ -74,7 +106,7 @@ def decode(choice,model,tokenizer):
             current_slot = None
             current_value = []
             for idx in pred:
-                label = Example.label_vocab.convert_idx_to_tag(idx)
+                label = convert_idx_to_tag[tuple(idx)]
                 if label.startswith("B-"):
                     if current_slot is not None:
                         triplet_str = f"{current_slot}-{''.join(current_value)}"
@@ -101,7 +133,7 @@ def decode(choice,model,tokenizer):
             current_slot = None
             current_value = []
             for idx in label:
-                label_name = Example.label_vocab.convert_idx_to_tag(idx)
+                label_name = convert_idx_to_tag[tuple(idx)]
                 if label_name.startswith("B-"):
                     if current_slot is not None:
                         triplet_str = f"{current_slot}-{''.join(current_value)}"
@@ -127,72 +159,6 @@ def decode(choice,model,tokenizer):
     gc.collect()
     return metrics, total_loss / count
 
-def predict(model,tokenizer):
-    
-    model.eval()
-    test_path = os.path.join(args.dataroot, 'test_unlabelled.json')
-    test_dataset = Example.load_dataset(test_path)
-    predictions = {}
-    with torch.no_grad():
-        for i in range(0, len(test_dataset), args.batch_size):
-            cur_dataset = test_dataset[i: i + args.batch_size]
-            input_ids, attention_masks, labels = encode_batch(cur_dataset, tokenizer, args.max_seq_len)
-            input_ids, attention_masks = input_ids.to(device), attention_masks.to(device)
-
-            logits = model(input_ids, attention_mask=attention_masks).logits
-            pred = torch.argmax(logits, dim=-1).cpu().tolist()
-            
-            input_ids = input_ids.cpu().tolist()  # 转换 input_ids 为 CPU 列表
-            for pi, (p, input_id) in enumerate(zip(pred, input_ids)):
-                did = cur_dataset[pi].did
-                tokens = tokenizer.convert_ids_to_tokens(input_id)  # 将 ID 转换为 token
-                tokens = [token for token in tokens if token != "[PAD]"]  # 去掉 [PAD] token
-                # 去掉 [CLS] 和 [SEP]
-                if "[CLS]" in tokens:
-                    tokens = tokens[1:]
-                if "[SEP]" in tokens:
-                    tokens = tokens[:-1]
-
-                label_seq = [Example.label_vocab.convert_idx_to_tag(idx) for idx in p[:len(tokens)]]
-
-                # 将预测的标签序列转换为 act-slot-value
-                triplets = []
-                current_act = None
-                current_slot = None
-                current_value = []
-
-                for idx, label in enumerate(label_seq):
-                    if label.startswith("B-"):
-                        if current_act and current_slot:
-                            triplets.append([current_act, current_slot, ''.join(current_value)])
-                        parts = label[2:].split('-')
-                        if len(parts) == 2:
-                            current_act, current_slot = parts
-                            current_value = [tokens[idx]]
-                    elif label.startswith("I-") and current_act and current_slot:  # 继续当前的 act-slot
-                        current_value.append(tokens[idx])
-                    elif label == "O" and current_act and current_slot:  # 结束当前 act-slot
-                        triplets.append([current_act, current_slot, ''.join(current_value)])
-                        current_act, current_slot = None, None
-                        current_value = []
-
-                # 确保最后一个 act-slot-value 被处理
-                if current_act and current_slot:
-                    triplets.append([current_act, current_slot, ''.join(current_value)])
-
-                predictions[did] = triplets
-
-    # 将预测结果保存到测试数据中
-    test_json = json.load(open(test_path, 'r', encoding='utf-8'))
-    for ei, example in enumerate(test_json):
-        for ui, utt in enumerate(example):
-            utt_id = f"{ei}-{ui}"
-            if utt_id in predictions:
-                utt['pred'] = predictions[utt_id]
-
-    output_path = os.path.join(args.dataroot, 'prediction.json')
-    json.dump(test_json, open(output_path, 'w', encoding='utf-8'), indent=4, ensure_ascii=False)
-
 def freeze_bert_layers(model, freeze_layers=10):
     """
     冻结 BERT 模型的前 `freeze_layers` 层的参数
@@ -209,18 +175,18 @@ def freeze_bert_layers(model, freeze_layers=10):
     for param in model.bert.embeddings.parameters():
         param.requires_grad = False
 
-def set_optimizer(model, lr, weight_decay, ratio):
+def set_optimizer(model, lr, weight_decay, step_size,gamma):
     import torch.optim as optim
     params = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
     grouped_params = [{'params': list(set([p for n, p in params]))}]
     optimizer = AdamW(grouped_params, lr=lr, weight_decay=weight_decay)
-    scheduler = get_scheduler(
-        name="linear",
-        optimizer=optimizer,
-        num_warmup_steps=int(ratio * ((len(train_dataset) // args.batch_size) * args.max_epoch)),
-        num_training_steps=((len(train_dataset) // args.batch_size) * args.max_epoch),
-    )
-    # scheduler = StepLR(optimizer, step_size=20, gamma=0.5)
+    # scheduler = get_scheduler(
+    #     name="linear",
+    #     optimizer=optimizer,
+    #     num_warmup_steps=int(ratio * ((len(train_dataset) // args.batch_size) * args.max_epoch)),
+    #     num_training_steps=((len(train_dataset) // args.batch_size) * args.max_epoch),
+    # )
+    scheduler = StepLR(optimizer, step_size=step_size, gamma=gamma)
     return optimizer, scheduler
 
 # 目标函数：定义需要优化的超参数和模型训练过程
@@ -228,26 +194,29 @@ def objective(trial):
     """
     目标函数：定义需要优化的超参数和模型训练过程
     """
-    lr = trial.suggest_loguniform('lr', 5e-6, 3e-2)  # 学习率范围
+    lr = trial.suggest_loguniform('lr', 1e-4, 3e-2)  # 学习率范围
     # freeze_layers = trial.suggest_int('freeze_layers', 8, 8)  # 冻结的 BERT 层数
     batch_size = trial.suggest_int('batch_size', 8, 48, step=8)  # 批次大小
     # batch_size = 8
-    max_epoch = trial.suggest_int('max_epoch', 10, 30)  # 最大训练 epoch 数
-    # max_epoch = 2
-    # step_size = trial.suggest_int('step_size', 5, 20)  # 调整 step_size 的值
-    # gamma = trial.suggest_uniform('gamma', 0.1, 0.9)  # 调整 gamma 的值
-    ratio = trial.suggest_uniform('ratio', 0, 0.2)  # 调整 ratio 的值
+    max_epoch = trial.suggest_int('max_epoch', 10, 16)  # 最大训练 epoch 数
+    # max_epoch = 30
+    step_size = trial.suggest_int('step_size', 5, 20)  # 调整 step_size 的值
+    gamma = trial.suggest_uniform('gamma', 0.1, 0.9)  # 调整 gamma 的值
+    # ratio = trial.suggest_uniform('ratio', 0, 0.2)  # 调整 ratio 的值
     weight_decay = trial.suggest_loguniform('weight_decay', 1e-5, 1e-2)
     
+    
+    custom_loss_weight = (5.0, 3.0, 1.0)
     
     # Load pre-trained BERT model and tokenizer
     bert_model_path = os.path.abspath(os.path.join(install_path, 'bert-base-chinese'))
     tokenizer = BertTokenizer.from_pretrained(bert_model_path)
-    model = BertForTokenClassification.from_pretrained(
-    bert_model_path, num_labels=Example.label_vocab.num_tags).to(device)
-        
+    config = BertConfig.from_pretrained("bert-base-chinese")
+    from model.slu_bert_withnet import CustomBertMultiHeadForTokenClassification
+    model = CustomBertMultiHeadForTokenClassification(config, num_labels_list = output_dim, type = args.encoder_cell, custom_loss_weight = custom_loss_weight).to(device)
+
     # 根据 Optuna 中的超参数冻结层
-    freeze_bert_layers(model, freeze_layers=8)
+    # freeze_bert_layers(model, freeze_layers=8)
 
     writer = SummaryWriter(log_dir="runs/slu_experiment_optuna")
     nsamples, step_size = len(train_dataset), batch_size
@@ -260,7 +229,7 @@ def objective(trial):
         num_training_steps = ((len(train_dataset) + args.batch_size - 1) // args.batch_size) * args.max_epoch
         ###
         print('Total training steps: %d' % (num_training_steps))
-        optimizer, scheduler = set_optimizer(model, lr ,weight_decay,ratio)
+        optimizer, scheduler = set_optimizer(model, lr ,weight_decay,step_size,gamma)
         nsamples, best_result = len(train_dataset), {'dev_acc': 0., 'dev_f1': 0.}
         train_index, step_size = np.arange(nsamples), args.batch_size
         print('Start training ......')
@@ -288,6 +257,7 @@ def objective(trial):
                 writer.add_scalar('Loss/train', loss , loss_cnt)
                 loss_cnt += 1
                 optimizer.step()
+                # scheduler.step()
                 count += 1
             print('Training: \tEpoch: %d\tTime: %.4f\tTraining Loss: %.4f' % (i, time.time() - start_time, epoch_loss / count))
             torch.cuda.empty_cache()
@@ -312,8 +282,7 @@ def objective(trial):
             if trial.should_prune():
                 raise optuna.exceptions.TrialPruned()
 
-
-        # print('FINAL BEST RESULT: \tDev loss: %.4f\tDev acc: %.4f\tDev fscore(p/r/f): (%.4f/%.4f/%.4f)' % ( best_result['dev_loss'], best_result['dev_acc'], best_result['dev_f1']['precision'], best_result['dev_f1']['recall'], best_result['dev_f1']['fscore']))
+        print('FINAL BEST RESULT: \tEpoch: %d\tDev loss: %.4f\tDev acc: %.4f\tDev fscore(p/r/f): (%.4f/%.4f/%.4f)' % (best_result['iter'], best_result['dev_loss'], best_result['dev_acc'], best_result['dev_f1']['precision'], best_result['dev_f1']['recall'], best_result['dev_f1']['fscore']))
     return best_result['dev_acc']
 
 
@@ -321,7 +290,9 @@ def objective(trial):
 study = optuna.create_study(direction='maximize')
 
 # 运行优化
-study.optimize(objective, n_trials=100)  # 试验次数（根据需要调整）
+study.optimize(objective, n_trials=30)  # 试验次数（根据需要调整）
+
+from optuna.visualization import plot_param_importances, plot_optimization_history, plot_slice
 
 # 生成各类图表
 param_importance_fig = plot_param_importances(study)
@@ -329,9 +300,9 @@ optimization_history_fig = plot_optimization_history(study)
 slice_plot_fig = plot_slice(study)
 
 # 将图表保存为文件（以 PNG 格式为例）
-param_importance_fig.write_image("param_importances.png")  # 参数重要性图表
-optimization_history_fig.write_image("optimization_history.png")  # 优化历史图表
-slice_plot_fig.write_image("slice_plot.png")  # Slice 图表
+param_importance_fig.write_image("param_importancesmh.png")  # 参数重要性图表
+optimization_history_fig.write_image("optimization_historymh.png")  # 优化历史图表
+slice_plot_fig.write_image("slice_plotmh.png")  # Slice 图表
 
 # 输出优化结果
 print(f"Best trial: {study.best_trial.number}")

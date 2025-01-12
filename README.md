@@ -15,3 +15,5 @@
 + `scripts/lora_bert.py`:lora实现以及训练脚本
 +  `scripts/slu_bert_multihead.py` 实现bert_multihead 训练 （基于optuna）
 + `models/slu_bert_withnet.py`: 不同FNN网络实现
+
+jbox link: https://jbox.sjtu.edu.cn/l/A12Aav

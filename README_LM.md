@@ -4,7 +4,7 @@
     source activate slu
     pip install torch
 
-经测试代码可以在 `python3.11`和 `pytorch=2.0.1+cu117`上运行，理论上在较低版本的环境上也能正常运行，如果你发现环境出现问题，可以尝试新建一个更新的环境
+
 
 ### 运行
 
@@ -16,8 +16,10 @@
 
 + `utils/args.py`:定义了所有涉及到的可选参数，如需改动某一参数可以在运行的时候将命令修改成
 
+
   python scripts/slu_baseline.py --`<arg>` `<value>`
   其中，`<arg>`为要修改的参数名，`<value>`为修改后的值
+
 + `utils/initialization.py`:初始化系统设置，包括设置随机种子和显卡/CPU
 + `utils/vocab.py`:构建编码输入输出的词表
 + `utils/word2vec.py`:读取词向量
@@ -46,9 +48,11 @@
 + jieba
   + 中文分词工具: https://github.com/fxsjy/jieba
 
+
 ### 提示
 
 我们提供了几个思考和探索的方向：
+
 
 - 对话历史该如何使用（严禁使用未来的对话来预测当前的对话）
 - 如何解决输入中的噪音问题

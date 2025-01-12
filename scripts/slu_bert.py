@@ -59,7 +59,7 @@ def freeze_bert_layers(model, freeze_layers=10):
 
 
 if args.testing:
-    check_point = torch.load(open('model_bert_best.bin', 'rb'), map_location=device)
+    check_point = torch.load(open('model_bert_small.bin', 'rb'), map_location=device)
     model.load_state_dict(check_point['model'])
     print("Load saved model from root path")
 
